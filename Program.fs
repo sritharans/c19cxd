@@ -27,91 +27,118 @@ open Microsoft.ML.Vision
 // This is the input schema that will be used by image loader to capture the orignal classification
 // and image data path. This will make up our initial data set.
 [<CLIMutable>]
-type ImageData = {
-    ImagePath:string // Path to the image to be loaded for training/validation/testing
-    Label:string     // The original classification label for the image (COVID-19/NORMAL/PNEUMONIA)
-}
+type ImageData =
+    { ImagePath: string // Path to the image to be loaded for training/validation/testing
+      Label: string } // The original classification label for the image (COVID-19/NORMAL/PNEUMONIA)
 
 // This schema will be used by the prediction model to predict the classification of the image.
 // The predicted classification could then be compared with the original classification.
 [<CLIMutable>]
-type ImagePrediction = {
-    ImagePath:string // Path to the image to be loaded for prediction
-    Label: string    // The original classification label for the image (COVID-19/NORMAL/PNEUMONIA)
-    PredictedLabel:string // The predicted classification label by the Image classification model
-}
+type ImagePrediction =
+    { ImagePath: string // Path to the image to be loaded for prediction
+      Label: string // The original classification label for the image (COVID-19/NORMAL/PNEUMONIA)
+      PredictedLabel: string } // The predicted classification label by the Image classification model
 
 // To time an execution of a function
-let duration f = 
+let duration f =
     let timer = Diagnostics.Stopwatch()
     timer.Start()
-    let returnValue = f
-    printfn "Elapsed Time: %i" timer.ElapsedMilliseconds
+    let returnValue = f ()
+    timer.Stop()
+    printfn "Elapsed Time: %f seconds" timer.Elapsed.TotalSeconds
     returnValue
 
 // Takes the location/path of the image directory and recursively loads their location into ImageData.
 // Returns an array containing the the image location (ImagePath) and it's classification (label)
 // Only the root folder/directory needs to be provided in the 'path' argument
-let LoadImagesDataset (path:string) =
+let LoadImagesDataset (path: string) =
     // Get all files in all subdirectories
-    Directory.GetFiles (path, "*", SearchOption.AllDirectories)
+    Directory.GetFiles(path, "*", SearchOption.AllDirectories)
     // Filter out files that are not in PNG format
-    |> Array.filter (fun file ->  (Path.GetExtension(file) = ".png"))
+    |> Array.filter (fun file -> (Path.GetExtension(file) = ".png"))
     // Get the full path for the image file and the directory it was stored in as the Label
-    |> Array.Parallel.map (fun file -> {ImagePath = file; Label = Directory.GetParent(file).Name})
+    |> Array.Parallel.map
+        (fun file ->
+            { ImagePath = file
+              Label = Directory.GetParent(file).Name })
 
 // Main program body
 [<EntryPoint>]
 let main argv =
- 
+
+    match argv.Length with
+    | 2 ->
+        printfn ">---------->"
+
+        printfn "[ Model: %A | Dataset: %s ]"
+        <| enum<ImageClassificationTrainer.Architecture> (int argv.[0])
+        <| argv.[1]
+
+        printfn "<----------<"
+    | _ ->
+        printfn "Usage: dotnet run <0/1/2/3> <dataset directory>"
+        printfn "0 - ResnetV2-101\n1 - InceptionV3\n2 - MobilenetV2\n3 - ResnetV2-50"
+        exit (0)
+
     // Get the current project directory and path to the X-ray images
     // The COVID-19_Radiography_Database folder contains X-ray images of patients that are:
     // - Typically healthy (NORMAL)
     // - Confirmed COVID-19 cases (COVID-19)
     // - Other viral pneumonia cases (PNEUMONIA)
-    let datasetDir = Directory.GetCurrentDirectory () + $"{Path.DirectorySeparatorChar}COVID-19_Radiography_Database"
-    
-    // We initialize MLContext. It provides a way for us to create components for data preparation,
-    // feature enginering, training, prediction and model evaluation.
-    let mlContext = MLContext (0)
+    let datasetDir = argv.[1]
 
-    // First we load the images into our ImageData schema        
+    // First we load the images into our ImageData schema
     let images = LoadImagesDataset datasetDir
+
+    // We then initialize the MLContext. It provides a way for us to create components for
+    // data preparation, feature enginering, training, prediction and model evaluation.
+    let mlContext = MLContext(0)
 
     // We then load the images into an IDataView type (it is analogous to a DataFrame in Pandas)
     // and shuffle the rows in the IDataView so it'll be better balanced
-    let data = 
-        images 
+    let data =
+        images
         |> mlContext.Data.LoadFromEnumerable
         |> mlContext.Data.ShuffleRows
 
     // Output some info about our Dataset, like the total number of images
-    printfn "Total images: %d" (int64 (data.GetRowCount ()))
+    printfn "[ Total images: %d ]" (int64 (data.GetRowCount()))
     // Display the first 5 rows in our Dataset
-    printfn "Dataset Sample: %A" (mlContext.Data.CreateEnumerable<ImageData> (data, true) |> Seq.take 5)
+    printfn ">---------->"
+
+    printfn
+        "Dataset Sample: %A"
+        (mlContext.Data.CreateEnumerable<ImageData>(data, true)
+         |> Seq.take 5)
+
+    printfn "<----------<"
 
     // Create our data pipeline that will be used by our model for training and testing
-    // This data pipeline will also contain the raw image data for each ImagePath
+    // This data pipeline will also contain the raw image data from each ImagePath
     // Each Label is also converted to a value key (0 - COVID-19, 1 - NORMAL, 2 - PNEUMONIA)
-    let dataPipeline = 
+    let dataPipeline =
         EstimatorChain()
-            .Append(mlContext.Transforms.Conversion.MapValueToKey ("LabelAsKey","Label"))
-            .Append(mlContext.Transforms.LoadRawImageBytes ("Image", null, "ImagePath"))
-    
+            .Append(mlContext.Transforms.Conversion.MapValueToKey("LabelAsKey", "Label"))
+            .Append(mlContext.Transforms.LoadRawImageBytes("Image", null, "ImagePath"))
+
     // We fit and transform the data to prepare it for training and testing
-    let preppedData = 
-        let processingTransformer = data |> dataPipeline.Fit 
-        data |> processingTransformer.Transform   
+    let preppedData =
+        let processingTransformer = data |> dataPipeline.Fit
+        data |> processingTransformer.Transform
 
     // We now split the data into train, validation and test sets
     // The first 70% of the data is used to train the model.
     // Out of the remaining 30%, 90% is used for validation and the remaining 10% is used for testing
-    let train, validate, test = 
+    let train, validate, test =
         preppedData
-        |> (fun originalData -> 
-                let trainValSplit = mlContext.Data.TrainTestSplit (originalData, 0.7)
-                let testValSplit = mlContext.Data.TrainTestSplit (trainValSplit.TestSet)
-                (trainValSplit.TrainSet, testValSplit.TrainSet, testValSplit.TestSet))
+        |> (fun originalData ->
+            let trainValSplit =
+                mlContext.Data.TrainTestSplit(originalData, 0.7)
+
+            let testValSplit =
+                mlContext.Data.TrainTestSplit(trainValSplit.TestSet)
+
+            (trainValSplit.TrainSet, testValSplit.TrainSet, testValSplit.TestSet))
 
     // Here we define the options for the ImageClassificationTrainer DNN
     // Currently the classifier supports the following DNN architerctures:
@@ -120,37 +147,58 @@ let main argv =
     // - MobilenetV2
     // - ResnetV2-50
     let dnnOptions = ImageClassificationTrainer.Options()
-    dnnOptions.FeatureColumnName <- "Image" 
+    dnnOptions.FeatureColumnName <- "Image"
     dnnOptions.LabelColumnName <- "LabelAsKey"
     dnnOptions.ValidationSet <- validate
-    dnnOptions.Arch <- ImageClassificationTrainer.Architecture.ResnetV2101
-    dnnOptions.MetricsCallback <- Action<ImageClassificationTrainer.ImageClassificationMetrics> (fun x -> printfn "%s" (x.ToString ()))
+    dnnOptions.Arch <- enum<ImageClassificationTrainer.Architecture> (int argv.[0])
+
+    dnnOptions.MetricsCallback <-
+        Action<ImageClassificationTrainer.ImageClassificationMetrics>(fun x -> printfn "[ %s ]" (x.ToString()))
 
     // We define the inputs for the training model pipeline
-    let trainingPipeline = 
+    let trainingPipeline =
         EstimatorChain()
-            .Append(mlContext.MulticlassClassification.Trainers.ImageClassification (dnnOptions))
-            .Append(mlContext.Transforms.Conversion.MapKeyToValue ("PredictedLabel", "LabelAsKey"))
+            .Append(mlContext.MulticlassClassification.Trainers.ImageClassification(dnnOptions))
+            .Append(mlContext.Transforms.Conversion.MapKeyToValue("PredictedLabel", "LabelAsKey"))
 
     // We then train and time the model
-    printfn "Training the model: %s" (nameof dnnOptions.Arch)
-    let trainedModel = duration (train |> trainingPipeline.Fit)
+    printfn ">---------->"
+    printfn "Training the model: %A" dnnOptions.Arch
+
+    let trainedModel =
+        duration (fun () -> train |> trainingPipeline.Fit)
+
+    printfn "<----------<"
 
     // We now define the prediction transform for the test data set
     let predictions = test |> trainedModel.Transform
 
     // We then evaluate the prediction model
-    printfn "Evaluating the model: %s" (nameof dnnOptions.Arch)
-    let metrics = duration (mlContext.MulticlassClassification.Evaluate (predictions, "LabelAsKey"))
-    printfn "MacroAccurracy: %f | LogLoss: %f" metrics.MacroAccuracy metrics.LogLoss
+    printfn ">---------->"
+    printfn "Evaluating model: %A" dnnOptions.Arch
+
+    let metrics =
+        duration (fun () -> mlContext.MulticlassClassification.Evaluate(predictions, "LabelAsKey"))
+
+    printfn "<----------<"
+    printfn "[ MacroAccurracy: %f | LogLoss: %f ]" metrics.MacroAccuracy metrics.LogLoss
 
     // We save our model so that we can reload it later if needed
-    mlContext.Model.Save (trainedModel, preppedData.Schema, Path.Join (Directory.GetCurrentDirectory (),"model.zip"))
+    mlContext.Model.Save(
+        trainedModel,
+        preppedData.Schema,
+        Path.Join(Directory.GetCurrentDirectory(), "model_" + argv.[0] + ".zip")
+    )
 
     // Display the first 50 predictions from the model evaluation
-    mlContext.Data.CreateEnumerable<ImagePrediction> (predictions, reuseRowObject=true)
+    printfn ">---------->"
+    printfn "Display the first 50 predictions:"
+
+    mlContext.Data.CreateEnumerable<ImagePrediction>(predictions, true)
     |> Seq.take 50
-    |> Seq.iter (fun p -> printfn "Original: %s | Predicted: %s" p.Label p.PredictedLabel) 
-    
+    |> Seq.iter (fun p -> printfn "[ Original: %s | Predicted: %s | Image: %s ]" p.Label p.PredictedLabel p.ImagePath)
+
+    printfn "<----------<"
+
     // Exit the program
     0 // return an integer exit code
